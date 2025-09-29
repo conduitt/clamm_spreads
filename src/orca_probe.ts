@@ -46,6 +46,14 @@ const sizes = parseSizes(argv.sizes, argv.range);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const fmtUSD = (n: number) => `$${n.toLocaleString(undefined, { maximumFractionDigits: 6 })}`;
 
+// ---------- symbols ----------
+const MINT_SYMBOL: Record<string, string> = {
+  So11111111111111111111111111111111111111112: "SOL",
+  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC",
+  Es9vMFrzaCERZ8YK4QNoPgPOnTnKpXc9E8uCQbQax4y: "USDT",
+};
+const symbolForMint = (mint: string) => MINT_SYMBOL[mint] ?? "";
+
 // ---------- Orca-compatible dummy wallet ----------
 type OrcaWallet = {
   publicKey: PublicKey;
@@ -67,26 +75,28 @@ function mkDummyWallet(): OrcaWallet {
 function csvHeader(): string[] {
   return [
     "ts_utc",
+    "dex",
     "pool",
     "program_id",
     "tick_spacing",
     "fee_ppm",
-    "fee_bps_one_leg",
+    "fee_bps",
     "protocol_fee_ppm",
     "liquidity_u128",
     "sqrt_price_x64",
     "tick_current",
-    "mintA","decA","mintB","decB",
-    "quote_mint","quote_decimals",
-    "base_mint","base_decimals",
+    "mintA","decA","symbolA",
+    "mintB","decB","symbolB",
+    "base_mint","base_decimals","base_symbol",
+    "quote_mint","quote_decimals","quote_symbol",
     "usd_per_quote",
     "mid_usd_per_base",
     "usd_notional",
     "buy_px_usd_per_base",
     "sell_px_usd_per_base",
     "roundtrip_bps",
-    "fee_bps_roundtrip",
-    "impact_bps",
+    "fee_bps_total",
+    "impact_bps_total",
     "buy_out_base",
     "sell_in_base",
     "buy_fee_quote",
@@ -128,15 +138,8 @@ async function usdPerQuoteFromOracle(
     const decB = (await ctx.fetcher.getMintInfo(new PublicKey(mintB)))?.decimals ?? await getMintDecimalsViaRPC(conn, mintB);
 
     const pxBperA = calcPxBperA_fromSqrt(d.sqrtPrice, decA, decB); // B per A
-    // We need USD per QUOTE
-    if (mintA === quoteMint && mintB === USDC) {
-      // QUOTE=A, USDC=B  → USD/QUOTE = (USDC per QUOTE)
-      return pxBperA.toNumber();
-    }
-    if (mintB === quoteMint && mintA === USDC) {
-      // QUOTE=B, USDC=A  → USD/QUOTE = 1 / (QUOTE per USDC) = 1 / (B per A)
-      return new Decimal(1).div(pxBperA).toNumber();
-    }
+    if (mintA === quoteMint && mintB === USDC) return pxBperA.toNumber();            // USD per QUOTE
+    if (mintB === quoteMint && mintA === USDC) return new Decimal(1).div(pxBperA).toNumber();
     return null;
   } catch {
     return null;
@@ -175,6 +178,10 @@ function asNumber(x: Decimal | number): number {
   const decA = mintInfoA?.decimals ?? await getMintDecimalsViaRPC(connection, mintA);
   const decB = mintInfoB?.decimals ?? await getMintDecimalsViaRPC(connection, mintB);
 
+  // symbols
+  const symbolA = symbolForMint(mintA);
+  const symbolB = symbolForMint(mintB);
+
   // Fee & pool params
   const tickSpacing = data.tickSpacing;
   const feePpm = Number(data.feeRate); // ppm (e.g., 400 -> 4 bps)
@@ -189,8 +196,9 @@ function asNumber(x: Decimal | number): number {
   // Decide QUOTE mint
   const quoteMint = pickQuoteMint(mintA, mintB, argv.quoteMint);
   const quoteDecimals = (quoteMint === mintA) ? decA : decB;
+  const quoteSymbol = symbolForMint(quoteMint);
 
-  // Compute USD per QUOTE
+  // USD per QUOTE
   let usdPerQuote = 1;
   if (quoteMint === USDC) {
     usdPerQuote = 1;
@@ -204,16 +212,15 @@ function asNumber(x: Decimal | number): number {
   const quoteIsA = quoteMint === mintA;
   const baseMint = quoteIsA ? mintB : mintA;
   const baseDecs = quoteIsA ? decB : decA;
+  const baseSymbol = symbolForMint(baseMint);
 
   // Pool-native price B per A, then QUOTE per BASE and USD per BASE
   const pxBperA = calcPxBperA_fromSqrt(sqrtPriceX64, decA, decB);
   let pxQuotePerBase: number;
   if (quoteIsA) {
-    // quote=A, base=B → QUOTE per BASE = A per B = 1 / (B per A)
-    pxQuotePerBase = asNumber(new Decimal(1).div(pxBperA));
+    pxQuotePerBase = asNumber(new Decimal(1).div(pxBperA)); // A per B
   } else {
-    // quote=B, base=A → QUOTE per BASE = B per A
-    pxQuotePerBase = asNumber(pxBperA);
+    pxQuotePerBase = asNumber(pxBperA);                      // B per A
   }
   const midUSDperBase = pxQuotePerBase * usdPerQuote;
 
@@ -231,7 +238,7 @@ function asNumber(x: Decimal | number): number {
     console.log(`tickCurrentIndex:     ${tickCurrent}`);
     console.log(`tokenMintA:           ${mintA} (dec=${decA})`);
     console.log(`tokenMintB:           ${mintB} (dec=${decB})`);
-    console.log(`quoteMint:            ${quoteMint} (dec=${quoteDecimals})   px_quote_per_BASE=${pxQuotePerBase}`);
+    console.log(`quoteMint:            ${quoteMint} (dec=${quoteDecimals})`);
     console.log(`USD per QUOTE:        ${usdPerQuote}`);
     console.log(`BASE mint:            ${baseMint} (dec=${baseDecs})`);
     console.log(`Mid (USD per BASE):   ${midUSDperBase.toFixed(8)}\n`);
@@ -295,6 +302,7 @@ function asNumber(x: Decimal | number): number {
 
       csv?.write([
         new Date().toISOString(),
+        "orca",
         poolPk.toBase58(),
         ORCA_WHIRLPOOL_PROGRAM_ID.toBase58(),
         tickSpacing,
@@ -304,9 +312,10 @@ function asNumber(x: Decimal | number): number {
         liquidity.toString(),
         sqrtPriceX64.toString(),
         tickCurrent,
-        mintA, decA, mintB, decB,
-        quoteMint, quoteDecimals,
-        baseMint, baseDecs,
+        mintA, decA, symbolA,
+        mintB, decB, symbolB,
+        baseMint, baseDecs, baseSymbol,
+        quoteMint, quoteDecimals, quoteSymbol,
         usdPerQuote,
         midUSDperBase,
         usd,
@@ -323,10 +332,10 @@ function asNumber(x: Decimal | number): number {
 
       if (argv.sleepMs > 0) await sleep(argv.sleepMs);
     } catch (e: any) {
-      const msg = e?.message || String(e);
-      if (!argv.quiet) console.log(`RT  ${fmtUSD(usd)}: error ${msg}`);
+      if (!argv.quiet) console.log(`RT  ${fmtUSD(usd)}: error ${e?.message || String(e)}`);
       csv?.write([
         new Date().toISOString(),
+        "orca",
         poolPk.toBase58(),
         ORCA_WHIRLPOOL_PROGRAM_ID.toBase58(),
         tickSpacing,
@@ -336,21 +345,22 @@ function asNumber(x: Decimal | number): number {
         liquidity.toString(),
         sqrtPriceX64.toString(),
         tickCurrent,
-        mintA, decA, mintB, decB,
-        quoteMint, quoteDecimals,
-        baseMint, baseDecs,
+        mintA, decA, symbolA,
+        mintB, decB, symbolB,
+        baseMint, baseDecs, baseSymbol,
+        quoteMint, quoteDecimals, quoteSymbol,
         usdPerQuote,
         Number.NaN, // mid_usd_per_base
         usd,
         Number.NaN, // buy_px_usd_per_base
         Number.NaN, // sell_px_usd_per_base
-        Number.NaN, // rt_bps
+        Number.NaN, // roundtrip_bps
         feeBps_roundtrip,
-        Number.NaN, // impact_bps
+        Number.NaN, // impact_bps_total
         Number.NaN, // buy_out_base
         Number.NaN, // sell_in_base
         Number.NaN, // buy_fee_quote
-        Number.NaN  // sell_fee_base
+        Number.NaN, // sell_fee_base
       ]);
     }
   }

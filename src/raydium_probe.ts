@@ -1,3 +1,10 @@
+/**
+ * Raydium CLMM spread probe (single-pool, RPC-only, no routing).
+ * - Pulls pool + tick arrays via @raydium-io/raydium-sdk-v2 (RPC)
+ * - Computes BUY (USD->A exact-in) and SELL (A->USD exact-out) on THIS POOL ONLY
+ * - Saves CSV with the unified schema (matching Orca)
+ */
+
 import { Connection, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import Decimal from "decimal.js";
@@ -60,10 +67,6 @@ const WSOL = "So11111111111111111111111111111111111111112";
 const Q64 = 2n ** 64n;
 
 const fmtUSD = (n: number) => `$${n.toLocaleString(undefined, { maximumFractionDigits: 6 })}`;
-const fmtNum = (n: number, d = 8) => n.toLocaleString(undefined, { maximumFractionDigits: d });
-const fmtBig = (s: unknown) =>
-  (typeof s === "string" ? s : (s as any)?.toString?.() ?? String(s)).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-
 const toBN = (amt: number, dec: number) => new BN(new Decimal(amt).mul(Decimal.pow(10, dec)).toFixed(0));
 const bnToNumber = (bn: BN, dec: number) => new Decimal(bn.toString()).div(Decimal.pow(10, dec)).toNumber();
 
@@ -72,14 +75,12 @@ async function getMintDecimalsViaRPC(conn: Connection, mint: string): Promise<nu
   if (mint === USDC) return 6;
   const info = await conn.getParsedAccountInfo(new PublicKey(mint));
   const dec = (info?.value as any)?.data?.parsed?.info?.decimals;
-  if (typeof dec === "number") return dec;
-  if (!argv.quiet) console.warn(`Warn: unable to fetch decimals for ${mint}, defaulting to 9`);
-  return 9;
+  return (typeof dec === "number") ? dec : 9;
 }
 
 // Convert on-chain sqrtPriceX64 -> price (tokenB per tokenA), adjusted for decimals.
-// Return USD per A (if USDC is A: invert B/A)
-function midUsdPerA_fromSqrt(
+// Return USD per BASE (non-USD side).
+function midUsdPerBase_fromSqrt(
   sqrtPriceX64: BN,
   decA: number,
   decB: number,
@@ -91,9 +92,9 @@ function midUsdPerA_fromSqrt(
   const pxBperA = ratio.mul(ratio).mul(Decimal.pow(10, decA - decB)); // B per A
   const isUsdA = mintA === USDC;
   const isUsdB = mintB === USDC;
-  if (isUsdB) return pxBperA.toNumber(); // USD is B: USD per A
-  if (isUsdA) return new Decimal(1).div(pxBperA).toNumber(); // USD is A: invert
-  return pxBperA.toNumber(); // neither is USD (we still return B/A)
+  if (isUsdB) return pxBperA.toNumber();              // USD per A (BASE=A)
+  if (isUsdA) return new Decimal(1).div(pxBperA).toNumber(); // USD per B (BASE=B)
+  return pxBperA.toNumber(); // if neither is USD, treat as quote per A
 }
 
 function normalizeFeePpm(raw: unknown): number {
@@ -103,31 +104,51 @@ function normalizeFeePpm(raw: unknown): number {
   return Math.round(n); // already ppm
 }
 
-// normalize the tick-array cache into { [start]: { startTickIndex, ticks } } ---
-function normalizeTickArrayCache(raw: Record<string, any>): Record<string, { startTickIndex: number; ticks: any[]; address?: any }> {
-  const out: Record<string, { startTickIndex: number; ticks: any[]; address?: any }> = {};
-  for (const [k, v] of Object.entries(raw ?? {})) {
-    const start =
-      (v as any)?.startTickIndex ??
-      (v as any)?.data?.startTickIndex ??
-      Number.isFinite(Number(k)) ? Number(k) : undefined;
+const MINT_SYMBOL: Record<string, string> = {
+  So11111111111111111111111111111111111111112: "SOL",
+  EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC",
+  Es9vMFrzaCERZ8YK4QNoPgPOnTnKpXc9E8uCQbQax4y: "USDT",
+};
+const symbolForMint = (mint: string) => MINT_SYMBOL[mint] ?? "";
 
-    const ticks = (v as any)?.ticks ?? (v as any)?.data?.ticks ?? [];
-    if (typeof start === "number" && Array.isArray(ticks)) {
-      out[String(start)] = {
-        startTickIndex: start,
-        ticks,
-        address: (v as any)?.address ?? (v as any)?.id ?? (v as any)?.pubkey,
-      };
-    }
+function extractTickArrayStartsUsed(rem: any, tickArrayCache: Record<string, any>): number[] {
+  const candidates: any[] =
+    rem?.tickArrayAccounts ??
+    rem?.tickArrayKeys ??
+    rem?.tickArrayAddresses ??
+    rem?.accounts ??
+    rem ??
+    [];
+  const toAddr = (x: any) =>
+    x?.toBase58?.() ||
+    x?.address?.toBase58?.() ||
+    x?.pubkey?.toBase58?.() ||
+    x?.address ||
+    (typeof x === "string" ? x : null);
+
+  const addrs = (Array.isArray(candidates) ? candidates : []).map(toAddr).filter(Boolean) as string[];
+  if (addrs.length === 0) return [];
+
+  const addrToStart: Record<string, number> = {};
+  for (const [startStr, ta] of Object.entries(tickArrayCache)) {
+    const addr =
+      (ta as any)?.address?.toBase58?.() ||
+      (ta as any)?.pubkey?.toBase58?.() ||
+      (ta as any)?.id?.toBase58?.() ||
+      (ta as any)?.address ||
+      null;
+    if (addr) addrToStart[String(addr)] = Number(startStr);
   }
-  return out;
+
+  const starts = addrs.map((a) => addrToStart[a]).filter((n) => Number.isFinite(n)) as number[];
+  return Array.from(new Set<number>(starts)).sort((a, b) => a - b);
 }
 
-// CSV header (Orca-aligned)
+// CSV header (aligned with Orca)
 function csvHeader(): (string | number)[] {
   return [
     "ts_utc",
+    "dex",
     "pool",
     "program_id",
     "tick_spacing",
@@ -137,19 +158,22 @@ function csvHeader(): (string | number)[] {
     "liquidity_u128",
     "sqrt_price_x64",
     "tick_current",
-    "mintA", "decA", "mintB", "decB",
-    "mid_usd_per_A",
+    "mintA","decA","symbolA",
+    "mintB","decB","symbolB",
+    "base_mint","base_decimals","base_symbol",
+    "quote_mint","quote_decimals","quote_symbol",
+    "usd_per_quote",
+    "mid_usd_per_base",
     "usd_notional",
-    "buy_exec_px",
-    "sell_exec_px",
+    "buy_px_usd_per_base",
+    "sell_px_usd_per_base",
     "roundtrip_bps",
     "fee_bps_total",
     "impact_bps_total",
-    "buy_qty_out_A",
-    "sell_qty_in_A",
-    "buy_fee_usd",
-    "sell_fee_usd",
-    "sell_fee_A",
+    "buy_out_base",
+    "sell_in_base",
+    "buy_fee_quote",
+    "sell_fee_base",
   ];
 }
 
@@ -171,12 +195,14 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
   if (!argv.quiet) {
     console.log("=== RAYDIUM_SPREADS (RPC single-pool) ===");
     console.log(`Pool=${argv.pool}`);
+    console.log("Roundtrip results (USD-sized):");
+    console.log("  Notional      Mid(USD/BASE)   BuyPx       SellPx      RT bps   Fee bps   Impact bps");
   }
 
   const conn = new Connection(argv.rpc, "confirmed");
 
   const raydium = await Raydium.load({
-    connection: conn as any,
+    connection: conn as any,          // type erase to avoid multi-web3.js mismatch
     disableFeatureCheck: true,
     disableLoadToken: true,
   });
@@ -208,19 +234,12 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     poolInfo: poolPick as any,
   });
 
-  // Tick arrays cache for this pool (normalize it so estimator can read startTickIndex)
+  // Tick arrays cache for this pool
   const taCacheMap = await PoolUtils.fetchMultiplePoolTickArrays({
     connection: conn as any,
     poolKeys: [clmmInfo],
   });
-
-  const rawCache: Record<string, any> = (taCacheMap as any)[argv.pool] || {};
-  const tickArrayCache = normalizeTickArrayCache(rawCache);
-
-  if (!argv.quiet) {
-    const nArrays = Object.keys(tickArrayCache).length;
-    console.log(`Loaded ${nArrays} tick arrays into cache`);
-  }
+  const tickArrayCache: Record<string, any> = (taCacheMap as any)[argv.pool] || {};
 
   // Pool fields
   const programId =
@@ -246,41 +265,35 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     (apiPool as any).mintB?.address ||
     (clmmInfo as any).mintB?.mint?.toString?.() ||
     (clmmInfo as any).mintB?.toString?.();
+
   const decA = await getMintDecimalsViaRPC(conn, mintA);
   const decB = await getMintDecimalsViaRPC(conn, mintB);
 
-  const midUSDperA = midUsdPerA_fromSqrt(sqrtPriceX64, decA, decB, mintA, mintB);
+  const symbolA = symbolForMint(mintA);
+  const symbolB = symbolForMint(mintB);
+
+  const midUSDperBase = midUsdPerBase_fromSqrt(sqrtPriceX64, decA, decB, mintA, mintB);
+
+  // base/quote identification (prefer USDC as quote)
   const isUsdA = mintA === USDC;
   const isUsdB = mintB === USDC;
-
-  if (!argv.quiet) {
-    console.log("\nRaydium CLMM Pool Summary");
-    console.log("-------------------------");
-    console.log(`Pool:                 ${argv.pool}`);
-    console.log(`Program:              ${programId}`);
-    console.log(`tickSpacing:          ${tickSpacing}`);
-    console.log(`feeRate (ppm):        ${feePpm_one_leg}   (~${(feePpm_one_leg / 100).toFixed(4)} bps each leg)`);
-    console.log(`protocolFeeRate(ppm): ${protoFeePpm}`);
-    console.log(`liquidity (u128?):    ${fmtBig(liquidity.toString())}`);
-    console.log(`sqrtPrice_x64:        ${fmtBig(sqrtPriceX64.toString())}`);
-    console.log(`tickCurrent:          ${tickCurrentIndex}`);
-    console.log(`tokenMintA:           ${mintA} (dec=${decA})`);
-    console.log(`tokenMintB:           ${mintB} (dec=${decB})`);
-    console.log(`Mid (USD per A):      ${midUSDperA.toFixed(8)}\n`);
-    console.log("Roundtrip results (USD-sized):");
-    console.log("  Notional      Mid(USD/BASE)   BuyPx       SellPx      RT bps   Fee bps   Impact bps");
-  }
+  const quoteMint   = isUsdB ? mintB : isUsdA ? mintA : mintB;
+  const quoteDecimals = (quoteMint === mintA) ? decA : decB;
+  const quoteSymbol = symbolForMint(quoteMint);
+  const baseMint  = isUsdB ? mintA : mintB;
+  const baseDecs  = isUsdB ? decA  : decB;
+  const baseSymbol = symbolForMint(baseMint);
+  const usdPerQuote = (quoteMint === USDC) ? 1 : 1; // keep=1 unless you add oracle logic
 
   // CSV
-  const csv = argv.csv ? mkCsvAppender(argv.csv, csvHeader()) : null;
+  const csv = argv.csv ? mkCsvAppender(argv.csv) : null;
+  if (csv) csv.write(csvHeader());
 
   // ---- Quote helpers (pool-only) ----
-  // BUY: spend USD -> receive A (exact-in on USD)
+  // BUY: spend USD -> receive BASE (exact-in on USD)
   function quoteBuy(usdNotional: number) {
-    const usdMint = isUsdB ? mintB : isUsdA ? mintA : mintB;
-    const usdDec = usdMint === mintA ? decA : decB;
-    const inputMintPk = new PublicKey(usdMint);
-    const amountInBN = toBN(usdNotional, usdDec);
+    const inputMintPk = new PublicKey(quoteMint);
+    const amountInBN = toBN(usdNotional, quoteDecimals);
 
     const res: any = PoolUtils.getOutputAmountAndRemainAccounts(
       clmmInfo as any,
@@ -293,31 +306,25 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     const remain = (res as any).remainAccounts ?? (res as any).remainingAccounts;
     const feeAmountBN: BN | undefined = res.feeAmount;
 
-    const outDec = usdMint === mintA ? decB : decA; // non-USD side
-    const outA = bnToNumber(expectedAmountOut, outDec);
-    const inUSD = usdNotional;
-    const execPx = inUSD / outA;
+    const outA = bnToNumber(expectedAmountOut, baseDecs);
+    const execPx = usdNotional / outA;
 
-    const totalBps = Math.abs((execPx / midUSDperA - 1) * 1e4);
-    const impactBps = Math.max(totalBps - feeBps_one_leg, 0);
-
-    // fee on input side (USD)
-    const buyFeeUSD =
+    // fee on input side (QUOTE)
+    const buyFeeQuote =
       typeof feeAmountBN !== "undefined"
-        ? bnToNumber(feeAmountBN, usdDec)
-        : new Decimal(inUSD).mul(feePpm_one_leg).div(1_000_000).toNumber();
+        ? bnToNumber(feeAmountBN, quoteDecimals)
+        : new Decimal(usdNotional).mul(feePpm_one_leg).div(1_000_000).toNumber();
 
-    // We keep the ‘used tick arrays’ note optional (not printed to CSV)
-    void remain;
-    return { outA, inUSD, execPx, totalBps, impactBps, buyFeeUSD };
+    const usedStarts = extractTickArrayStartsUsed(remain, tickArrayCache);
+    const usedTag = usedStarts.length ? `used=[${usedStarts[0]}..${usedStarts[usedStarts.length - 1]}] (${usedStarts.length} arrays)` : "";
+
+    return { outA, execPx, buyFeeQuote, usedTag };
   }
 
-  // SELL: sell A -> receive exact USD (exact-out on USD)
+  // SELL: sell BASE -> receive exact USD (exact-out on USD)
   function quoteSell(usdNotional: number) {
-    const usdMint = isUsdB ? mintB : isUsdA ? mintA : mintB;
-    const usdDec = usdMint === mintA ? decA : decB;
-    const outputMintPk = new PublicKey(usdMint);
-    const outBN = toBN(usdNotional, usdDec);
+    const outputMintPk = new PublicKey(quoteMint);
+    const outBN = toBN(usdNotional, quoteDecimals);
 
     const res: any = PoolUtils.getInputAmountAndRemainAccounts(
       clmmInfo as any,
@@ -330,43 +337,41 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     const remain = (res as any).remainAccounts ?? (res as any).remainingAccounts;
     const feeAmountBN: BN | undefined = res.feeAmount;
 
-    const inADec = usdMint === mintB ? decA : decB; // non-USD side
-    const inA = bnToNumber(expectedAmountIn, inADec);
-    const outUSD = usdNotional;
-    const execPx = outUSD / inA;
+    const inA = bnToNumber(expectedAmountIn, baseDecs);
+    const execPx = usdNotional / inA;
 
-    // fee charged on input side (A)
-    const feeA =
+    // fee charged on input side (BASE)
+    const sellFeeBase =
       typeof feeAmountBN !== "undefined"
-        ? bnToNumber(feeAmountBN, inADec)
+        ? bnToNumber(feeAmountBN, baseDecs)
         : new Decimal(inA).mul(feePpm_one_leg).div(1_000_000).toNumber();
-    const sellFeeUSD = feeA * execPx;
 
-    const totalBps = Math.abs((execPx / midUSDperA - 1) * 1e4);
-    const impactBps = Math.max(totalBps - feeBps_one_leg, 0);
+    const usedStarts = extractTickArrayStartsUsed(remain, tickArrayCache);
+    const usedTag = usedStarts.length ? `used=[${usedStarts[0]}..${usedStarts[usedStarts.length - 1]}] (${usedStarts.length} arrays)` : "";
 
-    void remain;
-    return { inA, outUSD, execPx, totalBps, impactBps, feeA, sellFeeUSD };
+    return { inA, execPx, sellFeeBase, usedTag };
   }
 
   for (const usd of sizes) {
     try {
       const b = quoteBuy(usd);
       const s = quoteSell(usd);
-      const rt_bps = ((b.execPx - s.execPx) / midUSDperA) * 1e4;
+      const rt_bps = ((b.execPx - s.execPx) / midUSDperBase) * 1e4;
       const impact_bps_total = Math.max(rt_bps - feeBps_total, 0);
 
       if (!argv.quiet) {
-        console.log(
-          `RT ${fmtUSD(usd).padStart(8)}  mid=${midUSDperA.toFixed(8)}  ` +
-          `buy=${b.execPx.toFixed(8)}  sell=${s.execPx.toFixed(8)}  ` +
-          `rt=${rt_bps.toFixed(4)}bps  fee=${(feeBps_total).toFixed(4)}bps  impact=${impact_bps_total.toFixed(4)}bps`
-        );
+        const line = [
+          `RT ${fmtUSD(usd).padStart(8)}  mid=${midUSDperBase.toFixed(8)}`,
+          `buy=${b.execPx.toFixed(8)}  sell=${s.execPx.toFixed(8)}`,
+          `rt=${rt_bps.toFixed(4)}bps  fee=${feeBps_total.toFixed(4)}bps  impact=${impact_bps_total.toFixed(4)}bps`,
+        ].join("  ");
+        console.log(line);
       }
 
-      // CSV row (aligned schema)
+      // CSV row (unified schema)
       csv?.write([
         new Date().toISOString(),
+        "raydium",
         argv.pool,
         programId,
         tickSpacing,
@@ -376,8 +381,12 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         (liquidity as BN).toString(),
         (sqrtPriceX64 as BN).toString(),
         tickCurrentIndex,
-        mintA, decA, mintB, decB,
-        midUSDperA,
+        mintA, decA, symbolA,
+        mintB, decB, symbolB,
+        baseMint, baseDecs, baseSymbol,
+        quoteMint, quoteDecimals, quoteSymbol,
+        usdPerQuote,
+        midUSDperBase,
         usd,
         b.execPx,
         s.execPx,
@@ -386,15 +395,14 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         impact_bps_total,
         b.outA,
         s.inA,
-        b.buyFeeUSD,
-        s.sellFeeUSD,
-        s.feeA,
+        b.buyFeeQuote,
+        s.sellFeeBase,
       ]);
     } catch (e: any) {
-      const msg = e?.message || String(e);
-      if (!argv.quiet) console.log(`RT  ${fmtUSD(usd)}: error ${msg}`);
+      if (!argv.quiet) console.log(`RT  ${fmtUSD(usd)}: error ${e?.message || String(e)}`);
       csv?.write([
         new Date().toISOString(),
+        "raydium",
         argv.pool,
         programId,
         tickSpacing,
@@ -404,25 +412,25 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         (liquidity as BN).toString(),
         (sqrtPriceX64 as BN).toString(),
         tickCurrentIndex,
-        mintA, decA, mintB, decB,
-        midUSDperA,
+        mintA, decA, symbolA,
+        mintB, decB, symbolB,
+        baseMint, baseDecs, baseSymbol,
+        quoteMint, quoteDecimals, quoteSymbol,
+        1,                  // usd_per_quote (kept 1)
+        Number.NaN,         // mid_usd_per_base
         usd,
-        Number.NaN, // buy_exec_px
-        Number.NaN, // sell_exec_px
-        Number.NaN, // roundtrip_bps
+        Number.NaN,         // buy_px_usd_per_base
+        Number.NaN,         // sell_px_usd_per_base
+        Number.NaN,         // roundtrip_bps
         feeBps_total,
-        Number.NaN, // impact_bps_total
-        Number.NaN, // buy_qty_out_A
-        Number.NaN, // sell_qty_in_A
-        Number.NaN, // buy_fee_usd
-        Number.NaN, // sell_fee_usd
-        Number.NaN, // sell_fee_A
+        Number.NaN,         // impact_bps_total
+        Number.NaN,         // buy_out_base
+        Number.NaN,         // sell_in_base
+        Number.NaN,         // buy_fee_quote
+        Number.NaN,         // sell_fee_base
       ]);
     }
   }
 
   csv?.close?.();
-})().catch((e) => {
-  console.error("Fatal:", e);
-  process.exit(1);
-});
+})();
