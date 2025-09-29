@@ -15,22 +15,36 @@ import { mkCsvAppender } from "./csv.js";
 type Args = {
   rpc: string;
   pool: string;
-  sizes: string;
-  range?: string;
+  sizes: string;     // comma list (e.g. "100,1000,5000")
+  range?: string;    // only set if user passes --range (start:end:step)
   csv?: string;
   quiet: boolean;
 };
 
 function parseSizes(argvSizes: string, range?: string): number[] {
+  // If --range was provided and looks like start:end:step, it takes precedence
   if (range && range.includes(":")) {
     const [a, b, s] = range.split(":").map((x) => Number(x.trim()));
-    if (Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(s) && s > 0) {
+    if ([a, b, s].every(Number.isFinite) && s > 0 && b >= a) {
       const out: number[] = [];
       for (let v = a; v <= b; v += s) out.push(v);
       return out;
     }
+    console.error(`Invalid --range "${range}". Expected start:end:step with positives.`);
+    process.exit(1);
   }
-  return argvSizes.split(",").map((s) => Number(s.trim())).filter((n) => n > 0);
+
+  // Otherwise parse --sizes (comma list)
+  const arr = argvSizes
+    .split(",")
+    .map((s) => Number(s.trim()))
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  if (!arr.length) {
+    console.error(`No valid --sizes parsed from "${argvSizes}". Use comma list, e.g. --sizes 1000,5000,10000`);
+    process.exit(1);
+  }
+  return arr;
 }
 
 const argv = (() => {
@@ -38,7 +52,7 @@ const argv = (() => {
     rpc: "https://api.mainnet-beta.solana.com",
     pool: "",
     sizes: "5000,10000,15000,20000,25000,30000,35000,40000,45000,50000",
-    range: "5000:50000:5000",
+    // range: undefined  // IMPORTANT: don't default range; only set if user passes --range
     csv: undefined,
     quiet: false,
   };
@@ -75,7 +89,7 @@ async function getMintDecimalsViaRPC(conn: Connection, mint: string): Promise<nu
   if (mint === USDC) return 6;
   const info = await conn.getParsedAccountInfo(new PublicKey(mint));
   const dec = (info?.value as any)?.data?.parsed?.info?.decimals;
-  return (typeof dec === "number") ? dec : 9;
+  return typeof dec === "number" ? dec : 9;
 }
 
 // Convert on-chain sqrtPriceX64 -> price (tokenB per tokenA), adjusted for decimals.
@@ -92,7 +106,7 @@ function midUsdPerBase_fromSqrt(
   const pxBperA = ratio.mul(ratio).mul(Decimal.pow(10, decA - decB)); // B per A
   const isUsdA = mintA === USDC;
   const isUsdB = mintB === USDC;
-  if (isUsdB) return pxBperA.toNumber();              // USD per A (BASE=A)
+  if (isUsdB) return pxBperA.toNumber();                   // USD per A (BASE=A)
   if (isUsdA) return new Decimal(1).div(pxBperA).toNumber(); // USD per B (BASE=B)
   return pxBperA.toNumber(); // if neither is USD, treat as quote per A
 }
@@ -195,6 +209,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
   if (!argv.quiet) {
     console.log("=== RAYDIUM_SPREADS (RPC single-pool) ===");
     console.log(`Pool=${argv.pool}`);
+    console.log(`Using sizes (USD notionals): ${sizes.join(", ")}`);
     console.log("Roundtrip results (USD-sized):");
     console.log("  Notional      Mid(USD/BASE)   BuyPx       SellPx      RT bps   Fee bps   Impact bps");
   }
@@ -357,6 +372,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
       const b = quoteBuy(usd);
       const s = quoteSell(usd);
       const rt_bps = ((b.execPx - s.execPx) / midUSDperBase) * 1e4;
+      const feeBps_total = (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100) * 2;
       const impact_bps_total = Math.max(rt_bps - feeBps_total, 0);
 
       if (!argv.quiet) {
@@ -375,9 +391,9 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         argv.pool,
         programId,
         tickSpacing,
-        feePpm_one_leg,
-        (feePpm_one_leg / 100).toFixed(4),
-        protoFeePpm,
+        normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0),
+        (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100).toFixed(4),
+        normalizeFeePpm((apiPool as any).protocolFeeRate ?? (clmmInfo as any).protocolFeeRate ?? 0),
         (liquidity as BN).toString(),
         (sqrtPriceX64 as BN).toString(),
         tickCurrentIndex,
@@ -385,7 +401,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         mintB, decB, symbolB,
         baseMint, baseDecs, baseSymbol,
         quoteMint, quoteDecimals, quoteSymbol,
-        usdPerQuote,
+        1,                  // usd_per_quote (kept 1)
         midUSDperBase,
         usd,
         b.execPx,
@@ -399,6 +415,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         s.sellFeeBase,
       ]);
     } catch (e: any) {
+      const feeBps_total = (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100) * 2;
       if (!argv.quiet) console.log(`RT  ${fmtUSD(usd)}: error ${e?.message || String(e)}`);
       csv?.write([
         new Date().toISOString(),
@@ -406,9 +423,9 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         argv.pool,
         programId,
         tickSpacing,
-        feePpm_one_leg,
-        (feePpm_one_leg / 100).toFixed(4),
-        protoFeePpm,
+        normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0),
+        (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100).toFixed(4),
+        normalizeFeePpm((apiPool as any).protocolFeeRate ?? (clmmInfo as any).protocolFeeRate ?? 0),
         (liquidity as BN).toString(),
         (sqrtPriceX64 as BN).toString(),
         tickCurrentIndex,
