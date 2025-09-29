@@ -1,11 +1,3 @@
-#!/usr/bin/env node
-/**
- * Raydium CLMM spread probe (single-pool, RPC-only, no routing).
- * - Pulls pool + tick arrays via @raydium-io/raydium-sdk-v2 (RPC)
- * - Computes BUY (USD->A exact-in) and SELL (A->USD exact-out) on THIS POOL ONLY
- * - Saves CSV with the Orca-aligned schema
- */
-
 import { Connection, PublicKey } from "@solana/web3.js";
 import BN from "bn.js";
 import Decimal from "decimal.js";
@@ -111,7 +103,7 @@ function normalizeFeePpm(raw: unknown): number {
   return Math.round(n); // already ppm
 }
 
-// --- NEW: normalize the tick-array cache into { [start]: { startTickIndex, ticks } } ---
+// normalize the tick-array cache into { [start]: { startTickIndex, ticks } } ---
 function normalizeTickArrayCache(raw: Record<string, any>): Record<string, { startTickIndex: number; ticks: any[]; address?: any }> {
   const out: Record<string, { startTickIndex: number; ticks: any[]; address?: any }> = {};
   for (const [k, v] of Object.entries(raw ?? {})) {
@@ -184,7 +176,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
   const conn = new Connection(argv.rpc, "confirmed");
 
   const raydium = await Raydium.load({
-    connection: conn as any,          // type erase to avoid multi-web3.js mismatch
+    connection: conn as any,
     disableFeatureCheck: true,
     disableLoadToken: true,
   });

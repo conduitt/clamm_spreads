@@ -1,4 +1,3 @@
-// src/common/utils.ts
 import { PublicKey } from "@solana/web3.js";
 
 /** Well-known mints */
@@ -25,7 +24,6 @@ export function prettySymbol(mint: string | PublicKey): string {
 /** Decimal helper without bringing a big library in here */
 export function bnToNumber(bn: bigint, decimals: number): number {
   const base = 10n ** BigInt(decimals);
-  // keep precision reasonable by splitting integer + fractional parts
   const int = Number(bn / base);
   const frac = Number(bn % base) / Number(base);
   return int + frac;

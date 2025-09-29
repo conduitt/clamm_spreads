@@ -7,6 +7,8 @@ Lightweight, RPC‑only spread/impact probes for **single pools** on Solana:
 
 They fetch on‑chain pool state + tick arrays, compute **BUY** (USD→A exact‑in) and **SELL** (A→USD exact‑out) quotes on **that pool only**, then print a summary and optionally produce **CSV files**.
 
+Quotes use **zero slippage tolerance** in the SDK calls. This measures pool‑native execution at size (fee + curve depth), without adding extra user‑side slippage buffers.
+
 ---
 
 ## Quick start
@@ -72,11 +74,6 @@ All flags are the same across Orca and Raydium probes.
 
 ## CSV Schema
 
-## Header (exact order)
-```
-ts_utc,pool,program_id,tick_spacing,fee_ppm,fee_bps_one_leg,protocol_fee_ppm,liquidity_u128,sqrt_price_x64,tick_current,mintA,decA,mintB,decB,quote_mint,quote_decimals,base_mint,base_decimals,usd_per_quote,mid_usd_per_base,usd_notional,buy_px_usd_per_base,sell_px_usd_per_base,roundtrip_bps,fee_bps_roundtrip,impact_bps,buy_out_base,sell_in_base,buy_fee_quote,sell_fee_base
-```
-
 ## Column semantics
 - `ts_utc` — ISO timestamp when the quotes were taken (UTC).
 - `pool` — Pool pubkey (Whirlpool or Raydium CLMM id).
@@ -104,12 +101,6 @@ ts_utc,pool,program_id,tick_spacing,fee_ppm,fee_bps_one_leg,protocol_fee_ppm,liq
 - `buy_fee_quote` — Fee charged on the BUY input side, in quote units (USD if quote = USDC).
 - `sell_fee_base` — Fee charged on the SELL input side, in BASE units.
 
-## Notes
-- Quotes use **zero slippage tolerance** in the SDK calls. This measures pool‑native execution at size (fee + curve depth), without adding extra user‑side slippage buffers.
-- No routing and no JIT liquidity assumptions; quotes are on the **specified pool only**.
-
----
-
 ## Output anatomy (console)
 
 Each run prints:
@@ -121,7 +112,3 @@ Each run prints:
 Use `--quiet` to suppress the pretty table when you only want CSV appends.
 
 ---
-
-## License
-
-MIT (or your project’s license).
