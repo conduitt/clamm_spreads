@@ -1,0 +1,13 @@
+# deps & build
+node_modules/
+dist/
+.npm/
+.nyc_output/
+
+# local data & env
+data/
+.env
+*.log
+
+# OS
+.DS_Store
