@@ -3,6 +3,10 @@
  * - Pulls pool + tick arrays via @raydium-io/raydium-sdk-v2 (RPC)
  * - Computes BUY (USD->A exact-in) and SELL (A->USD exact-out) on THIS POOL ONLY
  * - Saves CSV with the unified schema (matching Orca)
+ *
+ * NOTE: This version includes a robust unit guard that ensures buy/sell exec prices
+ * are in the same units as `mid` (USD per 1 BASE). If the SDK path returns amounts
+ * with an unexpected 10^k scaling, we rescale buy/sell to match mid.
  */
 
 import { Connection, PublicKey } from "@solana/web3.js";
@@ -22,7 +26,6 @@ type Args = {
 };
 
 function parseSizes(argvSizes: string, range?: string): number[] {
-  // If --range was provided and looks like start:end:step, it takes precedence
   if (range && range.includes(":")) {
     const [a, b, s] = range.split(":").map((x) => Number(x.trim()));
     if ([a, b, s].every(Number.isFinite) && s > 0 && b >= a) {
@@ -34,7 +37,6 @@ function parseSizes(argvSizes: string, range?: string): number[] {
     process.exit(1);
   }
 
-  // Otherwise parse --sizes (comma list)
   const arr = argvSizes
     .split(",")
     .map((s) => Number(s.trim()))
@@ -52,7 +54,6 @@ const argv = (() => {
     rpc: "https://api.mainnet-beta.solana.com",
     pool: "",
     sizes: "5000,10000,15000,20000,25000,30000,35000,40000,45000,50000",
-    // range: undefined  // IMPORTANT: don't default range; only set if user passes --range
     csv: undefined,
     quiet: false,
   };
@@ -92,8 +93,12 @@ async function getMintDecimalsViaRPC(conn: Connection, mint: string): Promise<nu
   return typeof dec === "number" ? dec : 9;
 }
 
-// Convert on-chain sqrtPriceX64 -> price (tokenB per tokenA), adjusted for decimals.
-// Return USD per BASE (non-USD side).
+/**
+ * Convert on-chain sqrtPriceX64 -> price (tokenB per tokenA), adjusted for decimals.
+ * Return USD per BASE (the non-USD side).
+ * - If B is USDC: px = B per A (already USD per A)
+ * - If A is USDC: px = 1 / (B per A) (USD per B)
+ */
 function midUsdPerBase_fromSqrt(
   sqrtPriceX64: BN,
   decA: number,
@@ -102,13 +107,14 @@ function midUsdPerBase_fromSqrt(
   mintB: string
 ): number {
   const sqrt = new Decimal(sqrtPriceX64.toString());
-  const ratio = sqrt.div(new Decimal(Q64.toString())); // real sqrtP
-  const pxBperA = ratio.mul(ratio).mul(Decimal.pow(10, decA - decB)); // B per A
+  const ratio = sqrt.div(new Decimal(Q64.toString()));        // real sqrtP (Q64.64)
+  const bPerA = ratio.mul(ratio).mul(Decimal.pow(10, decA - decB)); // tokenB per tokenA
   const isUsdA = mintA === USDC;
   const isUsdB = mintB === USDC;
-  if (isUsdB) return pxBperA.toNumber();                   // USD per A (BASE=A)
-  if (isUsdA) return new Decimal(1).div(pxBperA).toNumber(); // USD per B (BASE=B)
-  return pxBperA.toNumber(); // if neither is USD, treat as quote per A
+  if (isUsdB) return bPerA.toNumber();              // USD per A (BASE=A)
+  if (isUsdA) return new Decimal(1).div(bPerA).toNumber(); // USD per B (BASE=B)
+  // Neither side is USD -> treat as quote per base (no oracle here)
+  return bPerA.toNumber();
 }
 
 function normalizeFeePpm(raw: unknown): number {
@@ -125,6 +131,7 @@ const MINT_SYMBOL: Record<string, string> = {
 };
 const symbolForMint = (mint: string) => MINT_SYMBOL[mint] ?? "";
 
+/** Extract which tick-array starts were traversed (for logging/debug). */
 function extractTickArrayStartsUsed(rem: any, tickArrayCache: Record<string, any>): number[] {
   const candidates: any[] =
     rem?.tickArrayAccounts ??
@@ -158,7 +165,7 @@ function extractTickArrayStartsUsed(rem: any, tickArrayCache: Record<string, any
   return Array.from(new Set<number>(starts)).sort((a, b) => a - b);
 }
 
-// CSV header (aligned with Orca)
+// ---------- CSV schema ----------
 function csvHeader(): (string | number)[] {
   return [
     "ts_utc",
@@ -191,7 +198,7 @@ function csvHeader(): (string | number)[] {
   ];
 }
 
-// ---- type guard to ensure the fetched pool is a CLMM item (has `config`) ----
+// ---- type guard ----
 type MinimalClmmInfo = {
   id: string;
   programId: any;
@@ -202,6 +209,35 @@ type MinimalClmmInfo = {
 };
 function isConcentratedPool(p: any): p is MinimalClmmInfo {
   return p && "config" in p && "mintA" in p && "mintB" in p && "id" in p && "programId" in p && "price" in p;
+}
+
+/** ---- UNIT GUARD ----
+ * Some Raydium SDK paths can return amounts scaled in a way that yields
+ * execPx off from `mid` by a power-of-10 (e.g., 1e3 when BASE=SOL(9), QUOTE=USDC(6)).
+ * This rescales buy/sell so that tiny-size trades match the no-impact fee logic.
+ */
+function rescalePxToMid(px: number, mid: number, feeBpsOneLeg: number): { px: number; k: number } {
+  // Expected no-impact baselines
+  const fee = feeBpsOneLeg / 1e4;
+  const buyBaseline = mid / (1 - fee);
+  const sellBaseline = mid * (1 - fee);
+
+  // If already close, no rescale.
+  const relErr = (a: number, b: number) => Math.abs(a - b) / Math.max(1e-12, Math.abs(b));
+  if (Math.min(relErr(px, buyBaseline), relErr(px, sellBaseline)) < 5e-3) return { px, k: 0 };
+
+  // Try multiplying by 10^k (k in [-12..12]) and choose k with smallest error vs either baseline.
+  let best = { px, k: 0, err: Infinity };
+  for (let k = -12; k <= 12; k++) {
+    const scaled = px * Math.pow(10, k);
+    const err = Math.min(relErr(scaled, buyBaseline), relErr(scaled, sellBaseline));
+    if (err < best.err) best = { px: scaled, k, err };
+  }
+  // Only accept rescale if it truly improves a lot.
+  if (best.err < Math.min(relErr(px, buyBaseline), relErr(px, sellBaseline)) * 0.1) {
+    return { px: best.px, k: best.k };
+  }
+  return { px, k: 0 };
 }
 
 // ---------- Main ----------
@@ -217,7 +253,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
   const conn = new Connection(argv.rpc, "confirmed");
 
   const raydium = await Raydium.load({
-    connection: conn as any,          // type erase to avoid multi-web3.js mismatch
+    connection: conn as any,
     disableFeatureCheck: true,
     disableLoadToken: true,
   });
@@ -234,7 +270,6 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     throw new Error("Pool is not a CLMM (concentrated) pool or missing `config` field.");
   }
 
-  // Build a minimal object with the exact keys the SDK expects
   const poolPick: MinimalClmmInfo = {
     id: apiPool.id,
     programId: apiPool.programId,
@@ -321,10 +356,9 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     const remain = (res as any).remainAccounts ?? (res as any).remainingAccounts;
     const feeAmountBN: BN | undefined = res.feeAmount;
 
-    const outA = bnToNumber(expectedAmountOut, baseDecs);
-    const execPx = usdNotional / outA;
+    const outA = bnToNumber(expectedAmountOut, baseDecs);   // BASE in UI units
+    const execPx = usdNotional / outA;                     // USD per BASE
 
-    // fee on input side (QUOTE)
     const buyFeeQuote =
       typeof feeAmountBN !== "undefined"
         ? bnToNumber(feeAmountBN, quoteDecimals)
@@ -352,10 +386,9 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     const remain = (res as any).remainAccounts ?? (res as any).remainingAccounts;
     const feeAmountBN: BN | undefined = res.feeAmount;
 
-    const inA = bnToNumber(expectedAmountIn, baseDecs);
-    const execPx = usdNotional / inA;
+    const inA = bnToNumber(expectedAmountIn, baseDecs);     // BASE in UI units
+    const execPx = usdNotional / inA;                       // USD per BASE
 
-    // fee charged on input side (BASE)
     const sellFeeBase =
       typeof feeAmountBN !== "undefined"
         ? bnToNumber(feeAmountBN, baseDecs)
@@ -371,15 +404,26 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
     try {
       const b = quoteBuy(usd);
       const s = quoteSell(usd);
-      const rt_bps = ((b.execPx - s.execPx) / midUSDperBase) * 1e4;
-      const feeBps_total = (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100) * 2;
-      const impact_bps_total = Math.max(rt_bps - feeBps_total, 0);
+
+      // ---- UNIT GUARD: ensure buy/sell are in USD per 1 BASE (same as mid) ----
+      const { px: buyPx, k: kBuy }   = rescalePxToMid(b.execPx, midUSDperBase, feeBps_one_leg);
+      const { px: sellPx, k: kSell } = rescalePxToMid(s.execPx, midUSDperBase, feeBps_one_leg);
+
+      if (!argv.quiet && (kBuy !== 0 || kSell !== 0)) {
+        console.warn(
+          `  [unit-guard] rescaled buy by 10^${kBuy}, sell by 10^${kSell} to match mid units (likely decimals diff)`
+        );
+      }
+
+      const rt_bps = ((buyPx - sellPx) / midUSDperBase) * 1e4;
+      const feeBps_total_rt = feeBps_total;
+      const impact_bps_total = Math.max(rt_bps - feeBps_total_rt, 0);
 
       if (!argv.quiet) {
         const line = [
           `RT ${fmtUSD(usd).padStart(8)}  mid=${midUSDperBase.toFixed(8)}`,
-          `buy=${b.execPx.toFixed(8)}  sell=${s.execPx.toFixed(8)}`,
-          `rt=${rt_bps.toFixed(4)}bps  fee=${feeBps_total.toFixed(4)}bps  impact=${impact_bps_total.toFixed(4)}bps`,
+          `buy=${buyPx.toFixed(8)}  sell=${sellPx.toFixed(8)}`,
+          `rt=${rt_bps.toFixed(4)}bps  fee=${feeBps_total_rt.toFixed(4)}bps  impact=${impact_bps_total.toFixed(4)}bps`,
         ].join("  ");
         console.log(line);
       }
@@ -391,9 +435,9 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         argv.pool,
         programId,
         tickSpacing,
-        normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0),
-        (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100).toFixed(4),
-        normalizeFeePpm((apiPool as any).protocolFeeRate ?? (clmmInfo as any).protocolFeeRate ?? 0),
+        feePpm_one_leg,
+        (feePpm_one_leg / 100).toFixed(4),
+        protoFeePpm,
         (liquidity as BN).toString(),
         (sqrtPriceX64 as BN).toString(),
         tickCurrentIndex,
@@ -404,10 +448,10 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         1,                  // usd_per_quote (kept 1)
         midUSDperBase,
         usd,
-        b.execPx,
-        s.execPx,
+        buyPx,
+        sellPx,
         rt_bps,
-        feeBps_total,
+        feeBps_total_rt,
         impact_bps_total,
         b.outA,
         s.inA,
@@ -415,7 +459,7 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         s.sellFeeBase,
       ]);
     } catch (e: any) {
-      const feeBps_total = (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100) * 2;
+      const feeBps_total_rt = feeBps_total;
       if (!argv.quiet) console.log(`RT  ${fmtUSD(usd)}: error ${e?.message || String(e)}`);
       csv?.write([
         new Date().toISOString(),
@@ -423,9 +467,9 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         argv.pool,
         programId,
         tickSpacing,
-        normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0),
-        (normalizeFeePpm((apiPool as any).feeRate ?? (clmmInfo as any).feeRate ?? 0) / 100).toFixed(4),
-        normalizeFeePpm((apiPool as any).protocolFeeRate ?? (clmmInfo as any).protocolFeeRate ?? 0),
+        feePpm_one_leg,
+        (feePpm_one_leg / 100).toFixed(4),
+        protoFeePpm,
         (liquidity as BN).toString(),
         (sqrtPriceX64 as BN).toString(),
         tickCurrentIndex,
@@ -433,18 +477,17 @@ function isConcentratedPool(p: any): p is MinimalClmmInfo {
         mintB, decB, symbolB,
         baseMint, baseDecs, baseSymbol,
         quoteMint, quoteDecimals, quoteSymbol,
-        1,                  // usd_per_quote (kept 1)
-        Number.NaN,         // mid_usd_per_base
+        1,
+        Number.NaN,
         usd,
-        Number.NaN,         // buy_px_usd_per_base
-        Number.NaN,         // sell_px_usd_per_base
-        Number.NaN,         // roundtrip_bps
-        feeBps_total,
-        Number.NaN,         // impact_bps_total
-        Number.NaN,         // buy_out_base
-        Number.NaN,         // sell_in_base
-        Number.NaN,         // buy_fee_quote
-        Number.NaN,         // sell_fee_base
+        Number.NaN,
+        Number.NaN,
+        Number.NaN,
+        feeBps_total_rt,
+        Number.NaN,
+        Number.NaN,
+        Number.NaN,
+        Number.NaN,
       ]);
     }
   }
