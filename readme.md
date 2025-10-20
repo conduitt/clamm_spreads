@@ -1,5 +1,4 @@
-
-# CLMM Spreads — Orca & Raydium probes (USD pools)
+# CLMM Spreads — Orca & Raydium probes
 
 Lightweight, RPC‑only spread/impact probes for **single pools** on Solana:
 
@@ -9,9 +8,6 @@ Lightweight, RPC‑only spread/impact probes for **single pools** on Solana:
 They fetch on‑chain pool state + tick arrays, compute **BUY** (USD→BASE exact‑in) and **SELL** (BASE→USD exact‑out) quotes on that pool only, then print a summary and write a CSV.
 
 Quotes use **zero slippage tolerance** in the SDK calls. This measures pool‑native execution at size (fee + curve depth) without adding user‑side buffers.
-
-> **Scope / assumption**
-> These probes are intended for **USD pools** (USDC on one side). If the pool doesn’t include USDC, the scripts still run and prices are reported as QUOTE per BASE (not true USD). Extending to non‑USD pools requires adding an oracle to convert the quote asset to USD.
 
 ---
 
@@ -51,6 +47,22 @@ node dist/orca_probe.js \
   --csv rt_orca_usdc_sol.csv
 ```
 
+### Orca Whirlpools (USD mode)
+
+This mode executes trades in real USD notionals (e.g. $10, $1000) using the SOL/USD oracle pool for conversion when the quote isn’t USDC.
+
+Example: BTC/SOL pool with USD mode and oracle conversion
+
+```bash
+node dist/orca_probe.js \
+  --pool 9xE4w8w5eB6g9kqB3Qp9qz7Hj1bZ1JY8gQX9X9X9X9X9 \
+  --range 100:1000:100 \
+  --usdMode \
+  --oraclePool Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE
+```
+
+> **Note:** This mode ensures comparable execution measurements across non‑USDC pools.
+
 ---
 
 ## Flags
@@ -70,7 +82,7 @@ node dist/orca_probe.js \
 
 ## CSV schema & column semantics
 
-**Key columns (what you’ll usually keep):**
+**Main columns:**
 - `wts_utc` — ISO timestamp (UTC) when the quotes were taken.
 - `dex` — `"orca"` or `"raydium"`.
 - `pool` — Pool pubkey.
@@ -79,25 +91,10 @@ node dist/orca_probe.js \
 - `buy_px_usd_per_base` — Executed BUY price (USD/BASE) for **USD→BASE** exact‑in.
 - `sell_px_usd_per_base` — Executed SELL price (USD/BASE) for **BASE→USD** exact‑out.
 - `roundtrip_bps` — `(buy_px_usd_per_base − sell_px_usd_per_base) / mid_usd_per_base * 1e4`.
-- `fee_bps_total` — **Roundtrip** fee in bps (`2 × per‑leg taker fee`). Protocol fee cut is reported separately.
+- `fee_bps_total` — **Roundtrip** fee in bps (`2 × per‑leg taker fee`).
 - `impact_bps_total` — AMM curve/tick‑depth component: `max(roundtrip_bps − fee_bps_total, 0)`.
 
-**Extras:**
-- `program_id` — Program that owns the pool.
-- `tick_spacing` — Tick spacing.
-- `fee_ppm`, `fee_bps` — **Per‑leg** taker fee (ppm and bps).
-- `protocol_fee_ppm` — Protocol share of fees (reported; not added to the above).
-- `liquidity_u128` — Current pool liquidity (raw u128).
-- `sqrt_price_x64` — Current sqrt(P) in Q64.64.
-- `tick_current` — Current tick index.
-- `mintA`, `decA`, `symbolA`, `mintB`, `decB`, `symbolB` — Tokens and decimals.
-- `base_mint`, `base_decimals`, `base_symbol` — BASE side (usually the non‑USDC asset).
-- `quote_mint`, `quote_decimals`, `quote_symbol` — QUOTE side (usually USDC).
-- `usd_per_quote` — USD value of 1 unit of quote (1 if quote = USDC).
-- `buy_out_base` — BASE received on the BUY leg.
-- `sell_in_base` — BASE required on the SELL leg to receive the same USD back.
-- `buy_fee_quote` — Fee charged on the BUY input (QUOTE units; USD if quote=USDC).
-- `sell_fee_base` — Fee charged on the SELL input (BASE units).
+> Additional columns include pool parameters (fee, tick spacing, liquidity, protocol fee) and token metadata (mints, decimals, symbols).
 
 ---
 
@@ -130,7 +127,6 @@ The results can be graphed on plot:
 
 ## Assumptions & limitations
 
-- **USD pools focus.** Accurate USD reporting assumes USDC on one side.
 - **Single‑pool only.** No routing.
 - **Zero slippage tolerance** in SDK quotes (measures pool‑native execution; real trades may add buffers).
 - **Large sizes** may cross multiple tick‑arrays; if adjacent arrays are missing/uninitialized via RPC, quotes fail.
