@@ -11,3 +11,8 @@ data/
 
 # OS
 .DS_Store
+
+# other
+src/orca_dump_ticks.ts 
+orca.csv
+plot_exec_price_vs_size.py
